@@ -36,13 +36,20 @@ internal class Observation(
 
     suspend fun onSubscription(action: OnSubscriptionAction) = mutex.withLock {
         subscribers += action
-        val shouldStartObservation = !didStartObservation && subscribers.isNotEmpty() && isConnected
-        if (shouldStartObservation) {
-            suppressNotConnectedException {
+    if (isConnected) { // If connected, this new subscriber's action should be called
+        if (!didStartObservation) { // If observation hasn't started, start it
+            suppressNotConnectedException { // Or handle potential NotConnectedException if state changes during lock
                 startObservation()
-                action()
+                action() // Call the new subscriber's action
+            }
+        } else {
+            // Observation already started, just call the new subscriber's action
+            suppressNotConnectedException { // Or handle potential NotConnectedException
+                 action()
+            }
             }
         }
+    // If not connected, action() will be called by onConnected() later for all subscribers.
     }
 
     suspend fun onCompletion(action: OnSubscriptionAction) = mutex.withLock {

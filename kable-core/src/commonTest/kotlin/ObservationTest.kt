@@ -1,6 +1,69 @@
 package com.juul.kable
 
 import com.juul.kable.State.Connected
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+
+// Mock for Observation.Handler
+class MockObservationHandler : Observation.Handler {
+    var startCalled = 0
+    var stopCalled = 0
+    var lastCharacteristicStarted: Characteristic? = null
+    var lastCharacteristicStopped: Characteristic? = null
+
+    override suspend fun startObservation(characteristic: Characteristic) {
+        startCalled++
+        lastCharacteristicStarted = characteristic
+    }
+
+    override suspend fun stopObservation(characteristic: Characteristic) {
+        stopCalled++
+        lastCharacteristicStopped = characteristic
+    }
+
+    fun reset() {
+        startCalled = 0
+        stopCalled = 0
+        lastCharacteristicStarted = null
+        lastCharacteristicStopped = null
+    }
+}
+
+// Mock for Logging
+class MockLogger : Logging {
+    val messages = mutableListOf<String>()
+    override fun verbose(message: String) {
+        messages.add("VERBOSE: $message")
+    }
+
+    override fun debug(message: String) {
+        messages.add("DEBUG: $message")
+    }
+
+    override fun info(message: String) {
+        messages.add("INFO: $message")
+    }
+
+    override fun warn(message: String) {
+        messages.add("WARN: $message")
+    }
+
+    override fun error(message: String) {
+        messages.add("ERROR: $message")
+    }
+
+    override fun error(throwable: Throwable, message: String) {
+        messages.add("ERROR: $message, Exception: ${throwable.message}")
+    }
+
+    fun reset() {
+        messages.clear()
+    }
+}
+
+import com.juul.kable.State.Connected
 import com.juul.kable.State.Connecting
 import com.juul.kable.State.Disconnected
 import com.juul.kable.logs.LogEngine
@@ -345,6 +408,179 @@ class ObservationTest {
             expected = "action",
             actual = failure.message,
         )
+    }
+
+    @Test
+    fun `new subscriber, peripheral disconnected, action and startObservation not called`() = runTest {
+        val characteristic = generateCharacteristic()
+        val mockHandler = MockObservationHandler()
+        val mockLogger = MockLogger()
+        val stateFlow = MutableStateFlow<State>(Disconnected())
+
+        val observation = Observation(
+            state = stateFlow,
+            handler = mockHandler,
+            characteristic = characteristic,
+            logging = mockLogger,
+            identifier = "test"
+        )
+
+        var onSubscriptionCalled = false
+        observation.onSubscription {
+            onSubscriptionCalled = true
+        }
+
+        assertFalse(onSubscriptionCalled, "onSubscription action should not be called when disconnected")
+        assertEquals(0, mockHandler.startCalled, "startObservation should not be called when disconnected")
+    }
+
+    @Test
+    fun `new subscriber, peripheral connected, observation not started, action and startObservation called`() = runTest {
+        val characteristic = generateCharacteristic()
+        val mockHandler = MockObservationHandler()
+        val mockLogger = MockLogger()
+        // Casting `this` (TestCoroutineScope) to CoroutineScope for the `Connected` state.
+        val stateFlow = MutableStateFlow<State>(Connected(this as CoroutineScope))
+
+
+        val observation = Observation(
+            state = stateFlow,
+            handler = mockHandler,
+            characteristic = characteristic,
+            logging = mockLogger,
+            identifier = "test"
+        )
+
+        var onSubscriptionCalled = false
+        observation.onSubscription {
+            onSubscriptionCalled = true
+        }
+
+        assertTrue(onSubscriptionCalled, "onSubscription action should be called when connected and observation not started")
+        assertEquals(1, mockHandler.startCalled, "startObservation should be called when connected and observation not started")
+    }
+
+    @Test
+    fun `new subscriber, peripheral connected, observation already started, action called, startObservation not called again`() = runTest {
+        val characteristic = generateCharacteristic()
+        val mockHandler = MockObservationHandler()
+        val mockLogger = MockLogger()
+        val stateFlow = MutableStateFlow<State>(Connected(this as CoroutineScope))
+
+        val observation = Observation(
+            state = stateFlow,
+            handler = mockHandler,
+            characteristic = characteristic,
+            logging = mockLogger,
+            identifier = "test"
+        )
+
+        // First subscriber
+        var firstOnSubscriptionCalled = false
+        observation.onSubscription {
+            firstOnSubscriptionCalled = true
+        }
+
+        assertTrue(firstOnSubscriptionCalled, "First onSubscription action should be called")
+        assertEquals(1, mockHandler.startCalled, "startObservation should be called for the first subscriber")
+
+        // Second subscriber
+        var secondOnSubscriptionCalled = false
+        observation.onSubscription {
+            secondOnSubscriptionCalled = true
+        }
+
+        assertTrue(secondOnSubscriptionCalled, "Second onSubscription action should be called")
+        assertEquals(1, mockHandler.startCalled, "startObservation should not be called again for the second subscriber")
+    }
+
+    @Test
+    fun `onConnected behavior, actions called, startObservation called`() = runTest {
+        val characteristic = generateCharacteristic()
+        val mockHandler = MockObservationHandler()
+        val mockLogger = MockLogger()
+        val stateFlow = MutableStateFlow<State>(Disconnected())
+
+        val observation = Observation(
+            state = stateFlow,
+            handler = mockHandler,
+            characteristic = characteristic,
+            logging = mockLogger,
+            identifier = "test"
+        )
+
+        var firstOnSubscriptionCalled = false
+        observation.onSubscription {
+            firstOnSubscriptionCalled = true
+        }
+
+        var secondOnSubscriptionCalled = false
+        observation.onSubscription {
+            secondOnSubscriptionCalled = true
+        }
+
+        assertFalse(firstOnSubscriptionCalled, "First onSubscription action should not be called before connected")
+        assertFalse(secondOnSubscriptionCalled, "Second onSubscription action should not be called before connected")
+        assertEquals(0, mockHandler.startCalled, "startObservation should not be called before connected")
+
+        // Transition to connected
+        stateFlow.value = Connected(this as CoroutineScope)
+        observation.onConnected() // Manually trigger as state change might not be enough depending on Observation internal logic
+
+        assertTrue(firstOnSubscriptionCalled, "First onSubscription action should be called after connected")
+        assertTrue(secondOnSubscriptionCalled, "Second onSubscription action should be called after connected")
+        assertEquals(1, mockHandler.startCalled, "startObservation should be called after connected")
+    }
+
+    @Test
+    fun `onCompletion behavior, stopObservation called correctly`() = runTest {
+        val characteristic = generateCharacteristic()
+        val mockHandler = MockObservationHandler()
+        val mockLogger = MockLogger()
+        val stateFlow = MutableStateFlow<State>(Connected(this as CoroutineScope))
+
+        val observation = Observation(
+            state = stateFlow,
+            handler = mockHandler,
+            characteristic = characteristic,
+            logging = mockLogger,
+            identifier = "test"
+        )
+
+        // Scenario 1: One subscriber, cancels, stopObservation called
+        val job1 = launch {
+            observation.onSubscription { }
+        }
+        assertEquals(1, mockHandler.startCalled, "startObservation should be called for the first subscriber")
+        assertEquals(0, mockHandler.stopCalled, "stopObservation should not be called yet")
+
+        job1.cancel()
+        observation.onCompletion { } // Simulate the onCompletion call that would happen in a real flow
+        assertEquals(1, mockHandler.stopCalled, "stopObservation should be called after the only subscriber cancels")
+
+        // Reset for Scenario 2
+        mockHandler.reset()
+        var onSub1Called = false
+        var onSub2Called = false
+        val sub1Action = suspend { onSub1Called = true }
+        val sub2Action = suspend { onSub2Called = true }
+
+
+        // Scenario 2: Two subscribers, first cancels, stopObservation not called. Second cancels, stopObservation called.
+        val job2 = launch { observation.onSubscription(sub1Action) }
+        val job3 = launch { observation.onSubscription(sub2Action) }
+
+
+        assertEquals(1, mockHandler.startCalled, "startObservation should be called once for two subscribers")
+        assertEquals(0, mockHandler.stopCalled, "stopObservation should not be called yet")
+
+        job2.cancel()
+        observation.onCompletion(sub1Action) // Simulate onCompletion for subscriber 1
+        assertEquals(0, mockHandler.stopCalled, "stopObservation should not be called after only one of two subscribers cancels")
+
+        job3.cancel()
+        observation.onCompletion(sub2Action) // Simulate onCompletion for subscriber 2
+        assertEquals(1, mockHandler.stopCalled, "stopObservation should be called after both subscribers cancel")
     }
 }
 
